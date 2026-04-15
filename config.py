@@ -52,9 +52,10 @@ HF_TOKEN: str = ""
 # ── 7. Embedding model (sentence-transformers, no Ollama needed) ───────────────
 # Downloaded once to the sentence-transformers cache (~90 MB for the default).
 # Alternatives:
-#   "all-mpnet-base-v2"   ~420 MB, higher accuracy
+#   "all-mpnet-base-v2"             ~420 MB, higher accuracy
 #   "nomic-ai/nomic-embed-text-v1"  ~270 MB, strong retrieval quality
 EMBED_MODEL: str = "all-MiniLM-L6-v2"
+#   "all-MiniLM-L6-v2"              ~90 MB, default
 
 # ── 8. Vector database (Qdrant) ───────────────────────────────────────────────
 # REST API endpoint of your Qdrant instance.

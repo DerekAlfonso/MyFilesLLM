@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import logging
 
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
@@ -36,6 +37,10 @@ from config import (
     OLLAMA_MODEL,
     TOP_K_RESULTS,
 )
+
+logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+# or suppress the transformers loader specifically:
+logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
 
 console = Console()
 

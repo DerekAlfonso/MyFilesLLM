@@ -104,6 +104,22 @@ log.info(
 )
 
 
+def recreate_collection() -> None:
+    """Drop and recreate the Qdrant collection using the current model's vector size.
+
+    Use this when switching EMBED_MODEL — the existing collection's dimensions will
+    no longer match and every query will fail with a 400 dimension error.
+    """
+    if _client.collection_exists(COLLECTION_NAME):
+        _client.delete_collection(COLLECTION_NAME)
+        log.info(f"Deleted collection '{COLLECTION_NAME}'.")
+    _client.create_collection(
+        collection_name=COLLECTION_NAME,
+        vectors_config=VectorParams(size=_vector_size, distance=Distance.COSINE),
+    )
+    log.info(f"Created collection '{COLLECTION_NAME}' (dim={_vector_size}).")
+
+
 # ── Stable file ID ────────────────────────────────────────────────────────────
 
 def _stable_id(path: str) -> str:
@@ -574,7 +590,15 @@ if __name__ == "__main__":
         "--paths", nargs="+", metavar="PATH",
         help="Override WATCH_PATHS for this run"
     )
+    parser.add_argument(
+        "--recreate-collection", action="store_true",
+        help="Delete and recreate the Qdrant collection (required when switching EMBED_MODEL)"
+    )
     args = parser.parse_args()
+
+    if args.recreate_collection:
+        recreate_collection()
+        args.force = True  # collection is empty; re-index everything
 
     if args.stats:
         show_stats()
