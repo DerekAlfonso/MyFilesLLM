@@ -49,6 +49,25 @@ if errorlevel 1 (
     echo [WARN] pip upgrade failed — continuing anyway.
 )
 
+REM ── Detect NVIDIA GPU and install matching PyTorch ───────────────────────────
+echo.
+echo Detecting GPU for PyTorch variant selection...
+
+set TORCH_INDEX=https://download.pytorch.org/whl/cpu
+set TORCH_VARIANT=CPU-only
+
+for /f "tokens=1,2 delims=|" %%A in ('python detect_cuda.py') do (
+    set TORCH_INDEX=%%A
+    set TORCH_VARIANT=%%B
+)
+
+echo [OK] PyTorch variant: %TORCH_VARIANT%
+echo Installing PyTorch... (this will take a few minutes)
+pip install torch --index-url %TORCH_INDEX%
+if errorlevel 1 (
+    echo [WARN] PyTorch install failed — continuing; sentence-transformers will pull a default build.
+)
+
 REM ── Install dependencies ──────────────────────────────────────────────────────
 echo.
 echo Installing dependencies (this may take a few minutes)...
@@ -65,7 +84,7 @@ echo [OK] Dependencies installed.
 REM ── Verify imports ────────────────────────────────────────────────────────────
 echo.
 echo Verifying key imports...
-python -c "import chromadb, sentence_transformers, watchdog, fitz, docx, openpyxl, xlrd, rich, httpx; print('[OK] All imports successful.')"
+python -c "import torch, sentence_transformers, watchdog, fitz, docx, openpyxl, xlrd, rich, httpx; cuda=torch.cuda.is_available(); print('[OK] All imports successful. torch.cuda.is_available() =', cuda)"
 if errorlevel 1 (
     echo [WARN] One or more imports failed — check the output above.
 )
@@ -104,7 +123,7 @@ echo  It downloads the embedding model (~90 MB) on first run and
 echo  may take several minutes depending on how many files you have.
 echo.
 set /p RUN_INDEX="Start indexing now? (y/N): "
-if /i "!RUN_INDEX!"=="y" (
+if /i "%RUN_INDEX%"=="y" (
     echo.
     echo Running indexer...
     python indexer.py

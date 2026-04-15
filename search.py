@@ -40,7 +40,9 @@ from config import (
 console = Console()
 
 # ── Embedding model & Qdrant ──────────────────────────────────────────────────
-_model = SentenceTransformer(EMBED_MODEL)
+import torch
+_device = "cuda" if torch.cuda.is_available() else "cpu"
+_model = SentenceTransformer(EMBED_MODEL, device=_device)
 _client = QdrantClient(
     url=QDRANT_URL,
     api_key=QDRANT_API_KEY or None,
@@ -72,12 +74,13 @@ def semantic_search(question: str, k: int = TOP_K_RESULTS) -> dict:
     if total == 0:
         return {"documents": [[]], "metadatas": [[]], "distances": [[]]}
 
-    results = _client.search(
+    response = _client.query_points(
         collection_name=COLLECTION_NAME,
-        query_vector=_embed(question),
+        query=_embed(question),
         limit=min(k, total),
         with_payload=True,
     )
+    results = response.points
 
     docs      = [r.payload.get("document", "") for r in results]
     metas     = [{key: val for key, val in r.payload.items() if key != "document"} for r in results]

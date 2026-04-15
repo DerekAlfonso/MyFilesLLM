@@ -40,6 +40,7 @@ from config import (
     CONTENT_EXTENSIONS,
     CHUNK_SIZE,
     CHUNK_OVERLAP,
+    HF_TOKEN,
     EMBED_MODEL,
     QDRANT_URL,
     QDRANT_API_KEY,
@@ -47,6 +48,9 @@ from config import (
     COLLECTION_NAME,
     MAX_FILE_SIZE_MB,
 )
+
+if HF_TOKEN:
+    os.environ["HF_TOKEN"] = HF_TOKEN
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -61,19 +65,23 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # ── Embedding model ───────────────────────────────────────────────────────────
-log.info(f"Loading embedding model '{EMBED_MODEL}'…")
-_model = SentenceTransformer(EMBED_MODEL)
+import torch
+_device = "cuda" if torch.cuda.is_available() else "cpu"
+log.info(f"Loading embedding model '{EMBED_MODEL}' on {_device}…")
+_model = SentenceTransformer(EMBED_MODEL, device=_device)
 _vector_size: int = _model.get_sentence_embedding_dimension()
 
 
 def _embed(text: str) -> list[float]:
-    return _model.encode(text, normalize_embeddings=True).tolist()
+    return _model.encode(text, normalize_embeddings=True, show_progress_bar=False).tolist()
 
 
 def _embed_batch(texts: list[str]) -> list[list[float]]:
-    return _model.encode(texts, normalize_embeddings=True).tolist()
+    return _model.encode(texts, normalize_embeddings=True, show_progress_bar=True).tolist()
 
 
 # ── Qdrant setup ──────────────────────────────────────────────────────────────
@@ -222,11 +230,22 @@ def _parse_pdf(path: str) -> str:
     return "\n\n".join(pages)
 
 
+def _parse_text(path: str) -> str:
+    """Read a plain-text or code file, trying UTF-8 then falling back to latin-1."""
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return Path(path).read_text(encoding="latin-1")
+
+
+_TEXT_EXTENSIONS: set[str] = {".txt", ".md", ".py", ".cs", ".js", ".json", ".yml", ".yaml", ".php"}
+
 _PARSERS: dict[str, callable] = {
     ".docx": _parse_docx,
     ".xlsx": _parse_xlsx,
     ".xls":  _parse_xls,
     ".pdf":  _parse_pdf,
+    **{ext: _parse_text for ext in _TEXT_EXTENSIONS},
 }
 
 
@@ -320,6 +339,7 @@ def index_file(path: str, force: bool = False) -> str:
     if not force and not _needs_reindex(path):
         return "skipped"
 
+    log.info(f"Indexing: {stat['file_name']}")
     ext = stat["extension"]
     size_mb = stat["size_bytes"] / (1024 * 1024)
     is_content = ext in CONTENT_EXTENSIONS and size_mb <= MAX_FILE_SIZE_MB
@@ -353,7 +373,7 @@ def _store_meta_only(path: str, stat: dict) -> str:
 
 
 def _store_content(path: str, stat: dict, ext: str) -> str:
-    parser = _PARSERS[ext]
+    parser = _PARSERS.get(ext, _parse_text)
     try:
         text = parser(path)
     except Exception as exc:

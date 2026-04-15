@@ -2,7 +2,13 @@
   "permissions": {
     "allow": [
       "Bash(pip list:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Read(//d h:/Source/**)",
+      "Bash(.venv/Scripts/python.exe -)",
+      "Bash(.venv/Scripts/python.exe -c ':*)",
+      "Bash(.venv/Scripts/python:*)",
+      "Bash(.venv/Scripts/pip show:*)"
     ]
   }
 }
