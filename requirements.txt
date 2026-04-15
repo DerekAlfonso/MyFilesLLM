@@ -1,0 +1,27 @@
+# FileIndexer dependencies
+# Install with: pip install -r requirements.txt
+# Or use setup.bat for a fully-guided first-time setup.
+
+# ── Vector database ────────────────────────────────────────────────────────────
+chromadb>=0.5.0
+
+# ── Local embeddings (no GPU required; ~90 MB model downloaded on first run) ───
+sentence-transformers>=2.7.0
+
+# ── Filesystem watcher ────────────────────────────────────────────────────────
+watchdog>=4.0.0
+
+# ── Local LLM client (optional — search still works without Ollama running) ────
+ollama>=0.2.0
+
+# ── Document parsers ──────────────────────────────────────────────────────────
+python-docx>=1.0.0      # .docx files
+openpyxl>=3.1.0         # .xlsx files
+xlrd>=2.0.1             # .xls files (legacy Excel — xlrd 2.x does NOT read .xlsx)
+PyMuPDF>=1.24.0         # .pdf files  (imported as 'fitz')
+
+# ── Terminal UI ───────────────────────────────────────────────────────────────
+rich>=13.0.0
+
+# ── HTTP client used to probe Ollama availability ─────────────────────────────
+httpx>=0.27.0
