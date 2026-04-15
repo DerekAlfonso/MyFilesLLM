@@ -13,7 +13,6 @@ WATCH_PATHS: list[str] = [
 
 # ── 2. Directory names that are always skipped during scanning ─────────────────
 SKIP_DIRS: set[str] = {
-    "FileIndexer",              # this project's own folder
     ".git",
     "__pycache__",
     ".venv", "venv", ".env",
@@ -47,7 +46,7 @@ EMBED_MODEL: str = "all-MiniLM-L6-v2"
 
 # ── 7. Vector database (Qdrant) ───────────────────────────────────────────────
 # REST API endpoint of your Qdrant instance.
-QDRANT_URL: str = "https://dxp4800.local:6333"
+QDRANT_URL: str = "http://dxp4800.local:6333"
 
 # API key for Qdrant authentication.  Leave empty if authentication is disabled.
 QDRANT_API_KEY: str = ""
