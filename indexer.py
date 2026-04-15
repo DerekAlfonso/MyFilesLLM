@@ -1,4 +1,4 @@
-# indexer.py — Crawl directories and store file metadata + content in ChromaDB.
+# indexer.py — Crawl directories and store file metadata + content in Qdrant.
 """
 Every file encountered gets a searchable metadata record.
 DOCX / XLSX / XLS / PDF files also get text-chunk records for semantic search.
@@ -22,11 +22,16 @@ import hashlib
 import logging
 import os
 import sys
+import uuid
 from datetime import datetime
 from pathlib import Path
 
-import chromadb
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+from sentence_transformers import SentenceTransformer
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Distance, VectorParams, PointStruct, PointIdsList,
+    Filter, FieldCondition, MatchValue,
+)
 
 from config import (
     WATCH_PATHS,
@@ -36,7 +41,9 @@ from config import (
     CHUNK_SIZE,
     CHUNK_OVERLAP,
     EMBED_MODEL,
-    DB_PATH,
+    QDRANT_URL,
+    QDRANT_API_KEY,
+    QDRANT_VERIFY_SSL,
     COLLECTION_NAME,
     MAX_FILE_SIZE_MB,
 )
@@ -55,18 +62,38 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── ChromaDB setup ────────────────────────────────────────────────────────────
-# SentenceTransformerEmbeddingFunction auto-embeds documents on add() and
-# query_texts on query() — no manual embed() calls needed anywhere.
+# ── Embedding model ───────────────────────────────────────────────────────────
 log.info(f"Loading embedding model '{EMBED_MODEL}'…")
-_embed_fn = SentenceTransformerEmbeddingFunction(model_name=EMBED_MODEL)
-_client = chromadb.PersistentClient(path=DB_PATH)
-collection = _client.get_or_create_collection(
-    name=COLLECTION_NAME,
-    embedding_function=_embed_fn,
-    metadata={"hnsw:space": "cosine"},  # cosine distance: 0=identical, 1=unrelated
+_model = SentenceTransformer(EMBED_MODEL)
+_vector_size: int = _model.get_sentence_embedding_dimension()
+
+
+def _embed(text: str) -> list[float]:
+    return _model.encode(text, normalize_embeddings=True).tolist()
+
+
+def _embed_batch(texts: list[str]) -> list[list[float]]:
+    return _model.encode(texts, normalize_embeddings=True).tolist()
+
+
+# ── Qdrant setup ──────────────────────────────────────────────────────────────
+_client = QdrantClient(
+    url=QDRANT_URL,
+    api_key=QDRANT_API_KEY or None,
+    verify=QDRANT_VERIFY_SSL,
 )
-log.info(f"Collection '{COLLECTION_NAME}' ready. {collection.count()} records.")
+
+if not _client.collection_exists(COLLECTION_NAME):
+    _client.create_collection(
+        collection_name=COLLECTION_NAME,
+        vectors_config=VectorParams(size=_vector_size, distance=Distance.COSINE),
+    )
+    log.info(f"Created collection '{COLLECTION_NAME}' (dim={_vector_size}).")
+
+log.info(
+    f"Collection '{COLLECTION_NAME}' ready. "
+    f"{_client.count(COLLECTION_NAME, exact=True).count} records."
+)
 
 
 # ── Stable file ID ────────────────────────────────────────────────────────────
@@ -85,16 +112,24 @@ def _chunk_id(path: str, idx: int) -> str:
     return f"{_stable_id(path)}_chunk_{idx}"
 
 
+def _qdrant_id(str_id: str) -> str:
+    """Convert a string ID to a deterministic UUID5 for use as a Qdrant point ID."""
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, str_id))
+
+
 # ── Change detection ──────────────────────────────────────────────────────────
 
 def _needs_reindex(path: str) -> bool:
     """True if the file is new or its mtime_ns differs from the stored value."""
-    mid = _meta_id(path)
     try:
-        result = collection.get(ids=[mid], include=["metadatas"])
-        if not result["ids"]:
+        results = _client.retrieve(
+            collection_name=COLLECTION_NAME,
+            ids=[_qdrant_id(_meta_id(path))],
+            with_payload=["mtime_ns"],
+        )
+        if not results:
             return True
-        stored = result["metadatas"][0].get("mtime_ns")
+        stored = results[0].payload.get("mtime_ns")
         current = os.stat(path).st_mtime_ns
         return stored != current
     except Exception:
@@ -202,13 +237,13 @@ def _file_stat(path: str) -> dict:
     stat = os.stat(path)
     p = Path(path).resolve()
     return {
-        "file_name":    p.name,
-        "file_path":    str(p),
-        "extension":    p.suffix.lower(),
-        "size_bytes":   stat.st_size,
-        "date_created": datetime.fromtimestamp(stat.st_ctime).isoformat(timespec="seconds"),
+        "file_name":     p.name,
+        "file_path":     str(p),
+        "extension":     p.suffix.lower(),
+        "size_bytes":    stat.st_size,
+        "date_created":  datetime.fromtimestamp(stat.st_ctime).isoformat(timespec="seconds"),
         "date_modified": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
-        "mtime_ns":     stat.st_mtime_ns,   # int — used for change detection
+        "mtime_ns":      stat.st_mtime_ns,   # int — used for change detection
     }
 
 
@@ -228,28 +263,35 @@ def _meta_document(stat: dict, content_indexed: bool) -> str:
 # ── Delete helpers ────────────────────────────────────────────────────────────
 
 def _delete_chunks(path: str, total_chunks: int) -> None:
-    """Delete chunk records by reconstructed IDs — no where-filter scan needed."""
+    """Delete chunk records by reconstructed IDs."""
     if total_chunks <= 0:
         return
-    fid = _stable_id(path)
-    ids = [_chunk_id(path, i) for i in range(total_chunks)]
-    # get() silently omits absent IDs; delete() raises on absent IDs → check first
-    present = collection.get(ids=ids, include=[])
-    if present["ids"]:
-        collection.delete(ids=present["ids"])
+    ids = [_qdrant_id(_chunk_id(path, i)) for i in range(total_chunks)]
+    _client.delete(
+        collection_name=COLLECTION_NAME,
+        points_selector=PointIdsList(points=ids),
+    )
 
 
 def remove_file(path: str) -> None:
     """Remove all index records for *path*. Safe to call on un-indexed paths."""
-    mid = _meta_id(path)
+    qid = _qdrant_id(_meta_id(path))
     try:
-        result = collection.get(ids=[mid], include=["metadatas"])
-        if not result["ids"]:
+        results = _client.retrieve(
+            collection_name=COLLECTION_NAME,
+            ids=[qid],
+            with_payload=True,
+        )
+        if not results:
             return
-        total_chunks = int(result["metadatas"][0].get("total_chunks", 0))
+        payload = results[0].payload
+        total_chunks = int(payload.get("total_chunks", 0))
         _delete_chunks(path, total_chunks)
-        collection.delete(ids=[mid])
-        log.info(f"[removed] {result['metadatas'][0].get('file_name', path)}")
+        _client.delete(
+            collection_name=COLLECTION_NAME,
+            points_selector=PointIdsList(points=[qid]),
+        )
+        log.info(f"[removed] {payload.get('file_name', path)}")
     except Exception as e:
         log.debug(f"remove_file({path}): {e}")
 
@@ -289,19 +331,23 @@ def index_file(path: str, force: bool = False) -> str:
 
 
 def _store_meta_only(path: str, stat: dict) -> str:
-    mid = _meta_id(path)
-    # Remove any previous records (may have had content on a prior run)
-    old = collection.get(ids=[mid], include=["metadatas"])
-    if old["ids"]:
-        old_chunks = int(old["metadatas"][0].get("total_chunks", 0))
-        _delete_chunks(path, old_chunks)
-        collection.delete(ids=[mid])
+    qid = _qdrant_id(_meta_id(path))
 
-    collection.add(
-        ids=[mid],
-        documents=[_meta_document(stat, content_indexed=False)],
-        metadatas=[{**stat, "record_type": "meta", "content_indexed": False,
-                    "total_chunks": 0, "chunk_index": -1}],
+    # Remove any previous records (may have had content on a prior run)
+    old = _client.retrieve(collection_name=COLLECTION_NAME, ids=[qid], with_payload=["total_chunks"])
+    if old:
+        _delete_chunks(path, int(old[0].payload.get("total_chunks", 0)))
+        _client.delete(collection_name=COLLECTION_NAME, points_selector=PointIdsList(points=[qid]))
+
+    doc_text = _meta_document(stat, content_indexed=False)
+    _client.upsert(
+        collection_name=COLLECTION_NAME,
+        points=[PointStruct(
+            id=qid,
+            vector=_embed(doc_text),
+            payload={**stat, "record_type": "meta", "content_indexed": False,
+                     "total_chunks": 0, "chunk_index": -1, "document": doc_text},
+        )],
     )
     return "meta_only"
 
@@ -319,38 +365,47 @@ def _store_content(path: str, stat: dict, ext: str) -> str:
         log.info(f"No text extracted from '{path}' — storing metadata only")
         return _store_meta_only(path, stat)
 
-    mid = _meta_id(path)
+    qid = _qdrant_id(_meta_id(path))
     total = len(chunks)
 
     # Remove old records before writing new ones
-    old = collection.get(ids=[mid], include=["metadatas"])
-    if old["ids"]:
-        old_chunks = int(old["metadatas"][0].get("total_chunks", 0))
-        _delete_chunks(path, old_chunks)
-        collection.delete(ids=[mid])
+    old = _client.retrieve(collection_name=COLLECTION_NAME, ids=[qid], with_payload=["total_chunks"])
+    if old:
+        _delete_chunks(path, int(old[0].payload.get("total_chunks", 0)))
+        _client.delete(collection_name=COLLECTION_NAME, points_selector=PointIdsList(points=[qid]))
 
     # Write chunk records (in batches to avoid large single requests)
     BATCH = 100
     for b in range(0, total, BATCH):
-        batch = chunks[b:b + BATCH]
-        collection.add(
-            ids=[_chunk_id(path, b + i) for i in range(len(batch))],
-            documents=batch,
-            metadatas=[{
-                **stat,
-                "record_type":     "chunk",
-                "content_indexed": True,
-                "total_chunks":    total,
-                "chunk_index":     b + i,
-            } for i in range(len(batch))],
-        )
+        batch_chunks = chunks[b:b + BATCH]
+        embeddings = _embed_batch(batch_chunks)
+        points = [
+            PointStruct(
+                id=_qdrant_id(_chunk_id(path, b + i)),
+                vector=embeddings[i],
+                payload={
+                    **stat,
+                    "record_type":     "chunk",
+                    "content_indexed": True,
+                    "total_chunks":    total,
+                    "chunk_index":     b + i,
+                    "document":        batch_chunks[i],
+                },
+            )
+            for i in range(len(batch_chunks))
+        ]
+        _client.upsert(collection_name=COLLECTION_NAME, points=points)
 
     # Write metadata record last (total_chunks needed for future deletions)
-    collection.add(
-        ids=[mid],
-        documents=[_meta_document(stat, content_indexed=True)],
-        metadatas=[{**stat, "record_type": "meta", "content_indexed": True,
-                    "total_chunks": total, "chunk_index": -1}],
+    doc_text = _meta_document(stat, content_indexed=True)
+    _client.upsert(
+        collection_name=COLLECTION_NAME,
+        points=[PointStruct(
+            id=qid,
+            vector=_embed(doc_text),
+            payload={**stat, "record_type": "meta", "content_indexed": True,
+                     "total_chunks": total, "chunk_index": -1, "document": doc_text},
+        )],
     )
     return "indexed"
 
@@ -391,30 +446,36 @@ def cleanup_deleted() -> int:
     """Remove records for files that no longer exist on disk."""
     log.info("Scanning index for stale records…")
     removed = 0
-    offset = 0
-    PAGE = 500
+    offset = None
 
     while True:
         try:
-            page = collection.get(limit=PAGE, offset=offset, include=["metadatas"])
+            records, next_offset = _client.scroll(
+                collection_name=COLLECTION_NAME,
+                scroll_filter=Filter(
+                    must=[FieldCondition(key="record_type", match=MatchValue(value="meta"))]
+                ),
+                limit=500,
+                offset=offset,
+                with_payload=True,
+            )
         except Exception as exc:
             log.warning(f"Cleanup page error: {exc}")
             break
 
-        if not page["ids"]:
+        if not records:
             break
 
-        for record_id, meta in zip(page["ids"], page["metadatas"]):
-            if meta.get("record_type") != "meta":
-                offset += 1
-                continue
-            fpath = meta.get("file_path", "")
+        for record in records:
+            fpath = record.payload.get("file_path", "")
             if fpath and not os.path.exists(fpath):
                 log.info(f"Removing stale record: {fpath}")
                 remove_file(fpath)
                 removed += 1
-            else:
-                offset += 1
+
+        if next_offset is None:
+            break
+        offset = next_offset
 
     log.info(f"Cleanup done — {removed} stale file(s) removed.")
     return removed
@@ -423,27 +484,43 @@ def cleanup_deleted() -> int:
 # ── Stats ─────────────────────────────────────────────────────────────────────
 
 def show_stats() -> None:
-    total = collection.count()
-    print(f"\nCollection '{COLLECTION_NAME}' at {DB_PATH}")
+    total = _client.count(collection_name=COLLECTION_NAME, exact=True).count
+    print(f"\nCollection '{COLLECTION_NAME}' at {QDRANT_URL}")
     print(f"{'─'*50}")
     print(f"  Total records (chunks + metadata): {total:,}")
     if total == 0:
         print("  (Index is empty — run 'python indexer.py' to populate.)")
         return
 
-    all_records = collection.get(include=["metadatas"])
-    meta_records  = [m for m in all_records["metadatas"] if m.get("record_type") == "meta"]
-    chunk_records = [m for m in all_records["metadatas"] if m.get("record_type") == "chunk"]
-    indexed   = [m for m in meta_records if m.get("content_indexed") is True]
-    meta_only = [m for m in meta_records if not m.get("content_indexed")]
+    all_meta: list[dict] = []
+    all_chunks: list[dict] = []
+    offset = None
+    while True:
+        records, next_offset = _client.scroll(
+            collection_name=COLLECTION_NAME,
+            limit=1000,
+            offset=offset,
+            with_payload=True,
+        )
+        for r in records:
+            if r.payload.get("record_type") == "meta":
+                all_meta.append(r.payload)
+            elif r.payload.get("record_type") == "chunk":
+                all_chunks.append(r.payload)
+        if next_offset is None:
+            break
+        offset = next_offset
+
+    indexed   = [m for m in all_meta if m.get("content_indexed") is True]
+    meta_only = [m for m in all_meta if not m.get("content_indexed")]
 
     from collections import Counter
-    ext_counts = Counter(m.get("extension", "(none)") for m in meta_records)
+    ext_counts = Counter(m.get("extension", "(none)") for m in all_meta)
 
-    print(f"  Files tracked     : {len(meta_records):,}")
+    print(f"  Files tracked     : {len(all_meta):,}")
     print(f"  Content indexed   : {len(indexed):,}")
     print(f"  Metadata only     : {len(meta_only):,}")
-    print(f"  Searchable chunks : {len(chunk_records):,}")
+    print(f"  Searchable chunks : {len(all_chunks):,}")
     print(f"\n  File types:")
     for ext, cnt in ext_counts.most_common(20):
         marker = " [content]" if ext in CONTENT_EXTENSIONS else ""
@@ -455,7 +532,7 @@ def show_stats() -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="FileIndexer — index local files into a ChromaDB vector database"
+        description="FileIndexer — index local files into a Qdrant vector database"
     )
     parser.add_argument(
         "--force", action="store_true",

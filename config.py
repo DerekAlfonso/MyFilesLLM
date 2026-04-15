@@ -21,7 +21,6 @@ SKIP_DIRS: set[str] = {
     ".idea", ".vscode",
     "$RECYCLE.BIN",
     "System Volume Information",
-    "chroma_db",                # never index our own vector database
 }
 
 # ── 3. File names silently skipped at the file level ──────────────────────────
@@ -46,11 +45,16 @@ CHUNK_OVERLAP: int = 100  # character overlap between adjacent chunks
 #   "nomic-ai/nomic-embed-text-v1"  ~270 MB, strong retrieval quality
 EMBED_MODEL: str = "all-MiniLM-L6-v2"
 
-# ── 7. Vector database ────────────────────────────────────────────────────────
-# Absolute path so indexer and search agree regardless of working directory.
-DB_PATH: str = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "chroma_db"
-)
+# ── 7. Vector database (Qdrant) ───────────────────────────────────────────────
+# REST API endpoint of your Qdrant instance.
+QDRANT_URL: str = "https://dxp4800.local:6333"
+
+# API key for Qdrant authentication.  Leave empty if authentication is disabled.
+QDRANT_API_KEY: str = ""
+
+# Set to False when your Qdrant server uses a self-signed TLS certificate.
+QDRANT_VERIFY_SSL: bool = False
+
 COLLECTION_NAME: str = "documents"
 
 # ── 8. LLM via Ollama (only needed for Q&A, not for indexing) ─────────────────

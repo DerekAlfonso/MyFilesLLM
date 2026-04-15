@@ -1,6 +1,6 @@
 # search.py — Interactive Q&A over indexed files.
 """
-Retrieves semantically relevant file chunks from ChromaDB, then optionally
+Retrieves semantically relevant file chunks from Qdrant, then optionally
 passes them as context to a local LLM via Ollama to generate an answer.
 
 Works without Ollama — if Ollama is not running, the relevant files and
@@ -19,8 +19,8 @@ from __future__ import annotations
 import argparse
 import sys
 
-import chromadb
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+from sentence_transformers import SentenceTransformer
+from qdrant_client import QdrantClient
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -28,7 +28,9 @@ from rich import box
 
 from config import (
     EMBED_MODEL,
-    DB_PATH,
+    QDRANT_URL,
+    QDRANT_API_KEY,
+    QDRANT_VERIFY_SSL,
     COLLECTION_NAME,
     OLLAMA_HOST,
     OLLAMA_MODEL,
@@ -37,14 +39,17 @@ from config import (
 
 console = Console()
 
-# ── ChromaDB ──────────────────────────────────────────────────────────────────
-_embed_fn = SentenceTransformerEmbeddingFunction(model_name=EMBED_MODEL)
-_client = chromadb.PersistentClient(path=DB_PATH)
-collection = _client.get_or_create_collection(
-    name=COLLECTION_NAME,
-    embedding_function=_embed_fn,
-    metadata={"hnsw:space": "cosine"},
+# ── Embedding model & Qdrant ──────────────────────────────────────────────────
+_model = SentenceTransformer(EMBED_MODEL)
+_client = QdrantClient(
+    url=QDRANT_URL,
+    api_key=QDRANT_API_KEY or None,
+    verify=QDRANT_VERIFY_SSL,
 )
+
+
+def _embed(text: str) -> list[float]:
+    return _model.encode(text, normalize_embeddings=True).tolist()
 
 
 # ── Ollama availability ───────────────────────────────────────────────────────
@@ -63,11 +68,22 @@ def _ollama_available() -> bool:
 
 def semantic_search(question: str, k: int = TOP_K_RESULTS) -> dict:
     """Return top-k records sorted by cosine similarity to the question."""
-    return collection.query(
-        query_texts=[question],
-        n_results=min(k, collection.count()),
-        include=["documents", "metadatas", "distances"],
+    total = _client.count(collection_name=COLLECTION_NAME, exact=True).count
+    if total == 0:
+        return {"documents": [[]], "metadatas": [[]], "distances": [[]]}
+
+    results = _client.search(
+        collection_name=COLLECTION_NAME,
+        query_vector=_embed(question),
+        limit=min(k, total),
+        with_payload=True,
     )
+
+    docs      = [r.payload.get("document", "") for r in results]
+    metas     = [{key: val for key, val in r.payload.items() if key != "document"} for r in results]
+    distances = [1.0 - r.score for r in results]  # cosine similarity → distance
+
+    return {"documents": [docs], "metadatas": [metas], "distances": [distances]}
 
 
 # ── Result display ────────────────────────────────────────────────────────────
@@ -176,7 +192,7 @@ def _ask_llm(question: str, docs: list[str], metas: list[dict]) -> None:
 
 def ask(question: str, use_llm: bool = True) -> None:
     """Run a full search + optional LLM answer for a question."""
-    if collection.count() == 0:
+    if _client.count(collection_name=COLLECTION_NAME, exact=True).count == 0:
         console.print(
             "[red]The index is empty.[/red] Run [bold]python indexer.py[/bold] first."
         )

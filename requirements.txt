@@ -3,7 +3,7 @@
 # Or use setup.bat for a fully-guided first-time setup.
 
 # ── Vector database ────────────────────────────────────────────────────────────
-chromadb>=0.5.0
+qdrant-client>=1.9.0
 
 # ── Local embeddings (no GPU required; ~90 MB model downloaded on first run) ───
 sentence-transformers>=2.7.0
