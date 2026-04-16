@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import logging
 import os
 import sys
+import time
 import uuid
 import warnings
 from datetime import datetime
@@ -57,7 +59,12 @@ if HF_TOKEN:
 # ── Timeout exception types ───────────────────────────────────────────────────
 try:
     import httpx as _httpx
-    _TIMEOUT_EXCEPTIONS = (TimeoutError, _httpx.TimeoutException)
+    _TIMEOUT_EXCEPTIONS: tuple = (TimeoutError, _httpx.TimeoutException)
+    try:
+        import httpcore as _httpcore
+        _TIMEOUT_EXCEPTIONS = (TimeoutError, _httpx.TimeoutException, _httpcore.TimeoutException)
+    except ImportError:
+        pass
 except ImportError:
     _TIMEOUT_EXCEPTIONS = (TimeoutError,)
 
@@ -76,6 +83,26 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "indexer_state.json")
+
+
+def _read_last_run() -> int | None:
+    """Return the mtime_ns timestamp written by the previous run, or None."""
+    try:
+        with open(_STATE_FILE, encoding="utf-8") as f:
+            return int(json.load(f)["last_run_ns"])
+    except Exception:
+        return None
+
+
+def _write_last_run(ts_ns: int) -> None:
+    """Persist the run-start timestamp so the next --since-last-run can use it."""
+    with open(_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump({
+            "last_run_ns":  ts_ns,
+            "last_run_iso": datetime.fromtimestamp(ts_ns / 1e9).isoformat(timespec="seconds"),
+        }, f)
 
 # ── Embedding model ───────────────────────────────────────────────────────────
 warnings.filterwarnings("ignore", message="The following layers were not sharded")
@@ -476,7 +503,7 @@ def _store_content(path: str, stat: dict, ext: str) -> str:
 
 # ── Full scan ─────────────────────────────────────────────────────────────────
 
-def index_paths(paths: list[str], force: bool = False) -> dict[str, int]:
+def index_paths(paths: list[str], force: bool = False, since_ns: int | None = None) -> dict[str, int]:
     counts: dict[str, int] = {
         "indexed": 0, "meta_only": 0, "skipped": 0, "error": 0
     }
@@ -494,7 +521,16 @@ def index_paths(paths: list[str], force: bool = False) -> dict[str, int]:
             for fname in files:
                 if fname in SKIP_FILES or fname.startswith("~$"):
                     continue
-                result = index_file(os.path.join(root, fname), force=force)
+                fpath = os.path.join(root, fname)
+                if since_ns is not None:
+                    try:
+                        if os.stat(fpath).st_mtime_ns <= since_ns:
+                            counts["skipped"] += 1
+                            total += 1
+                            continue
+                    except OSError:
+                        pass  # let index_file handle missing/unreadable files normally
+                result = index_file(fpath, force=force)
                 counts[result] += 1
                 total += 1
                 if total % 100 == 0:
@@ -619,6 +655,14 @@ if __name__ == "__main__":
         help="Override WATCH_PATHS for this run"
     )
     parser.add_argument(
+        "--since-last-run", action="store_true",
+        help=(
+            "Only index files new or changed since the last run. "
+            "Falls back to a full scan if no prior run is recorded. "
+            "Much faster for incremental updates on large directories."
+        ),
+    )
+    parser.add_argument(
         "--recreate-collection", action="store_true",
         help="Delete and recreate the Qdrant collection (required when switching EMBED_MODEL)"
     )
@@ -637,6 +681,20 @@ if __name__ == "__main__":
         print(f"Result: {result}")
     else:
         paths = args.paths or WATCH_PATHS
+        run_start_ns = time.time_ns()
+
+        since_ns: int | None = None
+        if args.since_last_run:
+            since_ns = _read_last_run()
+            if since_ns is None:
+                log.info("No prior run recorded — performing full scan.")
+            else:
+                log.info(
+                    "Incremental scan: files modified since "
+                    f"{datetime.fromtimestamp(since_ns / 1e9).isoformat(timespec='seconds')}"
+                )
+
         log.info(f"Indexing {len(paths)} path(s): {paths}")
-        counts = index_paths(paths, force=args.force)
+        counts = index_paths(paths, force=args.force, since_ns=since_ns)
+        _write_last_run(run_start_ns)
         print(f"\nDone: {counts}")

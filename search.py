@@ -56,6 +56,7 @@ _client = QdrantClient(
     url=QDRANT_URL,
     api_key=QDRANT_API_KEY or None,
     verify=QDRANT_VERIFY_SSL,
+    timeout=SEARCH_TIMEOUT_SECONDS,
 )
 
 
