@@ -23,6 +23,7 @@ import logging
 import os
 import sys
 import uuid
+import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -47,10 +48,18 @@ from config import (
     QDRANT_VERIFY_SSL,
     COLLECTION_NAME,
     MAX_FILE_SIZE_MB,
+    INDEX_RETRY_LIMIT,
 )
 
 if HF_TOKEN:
     os.environ["HF_TOKEN"] = HF_TOKEN
+
+# ── Timeout exception types ───────────────────────────────────────────────────
+try:
+    import httpx as _httpx
+    _TIMEOUT_EXCEPTIONS = (TimeoutError, _httpx.TimeoutException)
+except ImportError:
+    _TIMEOUT_EXCEPTIONS = (TimeoutError,)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -69,6 +78,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # ── Embedding model ───────────────────────────────────────────────────────────
+warnings.filterwarnings("ignore", message="The following layers were not sharded")
 import torch
 _device = "cuda" if torch.cuda.is_available() else "cpu"
 log.info(f"Loading embedding model '{EMBED_MODEL}' on {_device}…")
@@ -355,15 +365,33 @@ def index_file(path: str, force: bool = False) -> str:
     if not force and not _needs_reindex(path):
         return "skipped"
 
-    log.info(f"Indexing: {stat['file_name']}")
     ext = stat["extension"]
     size_mb = stat["size_bytes"] / (1024 * 1024)
     is_content = ext in CONTENT_EXTENSIONS and size_mb <= MAX_FILE_SIZE_MB
 
-    if not is_content:
-        return _store_meta_only(path, stat)
+    for attempt in range(1, INDEX_RETRY_LIMIT + 1):
+        if attempt == 1:
+            log.info(f"Indexing: {stat['file_name']}")
+        else:
+            log.warning(f"Retrying ({attempt}/{INDEX_RETRY_LIMIT}): {stat['file_name']}")
+        try:
+            if not is_content:
+                return _store_meta_only(path, stat)
+            return _store_content(path, stat, ext)
+        except _TIMEOUT_EXCEPTIONS as exc:
+            if attempt < INDEX_RETRY_LIMIT:
+                log.warning(
+                    f"Timeout indexing '{stat['file_name']}' "
+                    f"(attempt {attempt}/{INDEX_RETRY_LIMIT}): {exc}"
+                )
+            else:
+                log.error(
+                    f"Timeout indexing '{stat['file_name']}' "
+                    f"after {INDEX_RETRY_LIMIT} attempt(s) — skipping"
+                )
+                return "error"
 
-    return _store_content(path, stat, ext)
+    return "error"  # unreachable; satisfies type checker
 
 
 def _store_meta_only(path: str, stat: dict) -> str:

@@ -89,3 +89,5 @@ DEBOUNCE_SECONDS: float = 3.0
 # ── 11. Search limits ─────────────────────────────────────────────────────────
 MAX_FILE_SIZE_MB: float = 50.0  # files larger than this skip content extraction
 TOP_K_RESULTS:    int = 10      # number of chunks retrieved per search query
+SEARCH_TIMEOUT_SECONDS: float = 15.0  # max seconds to wait for a search query before giving up
+INDEX_RETRY_LIMIT: int = 3      # max attempts when a timeout occurs while indexing a file

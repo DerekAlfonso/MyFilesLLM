@@ -17,8 +17,10 @@ Usage
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import sys
 import logging
+import warnings
 
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
@@ -36,8 +38,10 @@ from config import (
     OLLAMA_HOST,
     OLLAMA_MODEL,
     TOP_K_RESULTS,
+    SEARCH_TIMEOUT_SECONDS,
 )
 
+warnings.filterwarnings("ignore", message="The following layers were not sharded")
 logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
 # or suppress the transformers loader specifically:
 logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
@@ -177,7 +181,7 @@ def _ask_llm(question: str, docs: list[str], metas: list[dict]) -> None:
     console.rule("[bold green]AI Answer[/bold green]")
 
     try:
-        client = _ollama.Client(host=OLLAMA_HOST)
+        client = _ollama.Client(host=OLLAMA_HOST, timeout=SEARCH_TIMEOUT_SECONDS)
         stream = client.chat(
             model=OLLAMA_MODEL,
             messages=[{"role": "user", "content": prompt}],
@@ -206,7 +210,20 @@ def ask(question: str, use_llm: bool = True) -> None:
         )
         return
 
-    results = semantic_search(question)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(semantic_search, question)
+            results = future.result(timeout=SEARCH_TIMEOUT_SECONDS)
+    except concurrent.futures.TimeoutError:
+        console.print(
+            f"\n[yellow]Search timed out after {SEARCH_TIMEOUT_SECONDS:.0f} s.[/yellow] "
+            "The index or network may be slow — please try again."
+        )
+        return
+    except Exception as exc:
+        console.print(f"\n[red]Search error:[/red] {exc}")
+        return
+
     if not results or not results["documents"][0]:
         console.print("[yellow]No results found for that query.[/yellow]")
         return
